@@ -1,0 +1,638 @@
+/**
+ * Approval flow: when a trip's Status becomes "Pending", approvers receive an
+ * email and SMS with Approve / Reject links. Clicking a link hits the web app
+ * (doGet), which validates a one-time token and updates the Status cell.
+ *
+ * SETUP:
+ * 1. Create an "Approvers" sheet: columns A=Name, B=Email, C=Phone (rows 2+).
+ * 2. Deploy -> New deployment -> Web app: Execute as "Me",
+ *    Who has access "Anyone". Paste the URL into APPROVAL_WEBAPP_URL below.
+ * 3. Run approvalSetupCheck() once to authorize.
+ */
+
+const APPROVAL_CONFIG = {
+  webAppUrl: 'https://script.google.com/macros/s/YOUR_WEB_APP_DEPLOYMENT_ID/exec',
+  approversSheet: 'Approvers',
+  tripSheet: 'Trip Requests',
+  triggerStatus: 'Pending',
+  approvedStatus: 'Approved',
+  rejectedStatus: 'Rejected',
+  statusCol: 11,          // K (1-based), matches COL_NUM.status in Code.gs
+  requestNoCol: 1,        // A
+  tokenTtlMinutes: 48 * 60,
+  tokenPrefix: 'approval_token:'
+};
+
+/**
+ * Installable On-Edit handler: fires approval requests when Status becomes Pending.
+ */
+function onStatusPendingApproval(e) {
+  if (!e || !e.range) {
+    Logger.log('onStatusPendingApproval: no edit event (run manually?) - nothing to do.');
+    return;
+  }
+  const range = e.range;
+  if (range.getSheet().getName() !== APPROVAL_CONFIG.tripSheet) return;
+  if (range.getColumn() !== APPROVAL_CONFIG.statusCol) return;
+  if (range.getNumRows() !== 1 || range.getNumColumns() !== 1) {
+    Logger.log(`onStatusPendingApproval: ignored multi-cell edit at ${range.getA1Notation()}.`);
+    return;
+  }
+  if (range.getRow() < TRIP_START_ROW) return;
+
+  const newVal = String(range.getDisplayValue()).trim();
+  Logger.log(`onStatusPendingApproval: row ${range.getRow()} status is "${newVal}".`);
+  if (newVal.toLowerCase() !== APPROVAL_CONFIG.triggerStatus.toLowerCase()) return;
+
+  try {
+    sendApprovalRequests_(range.getSheet(), range.getRow());
+  } catch (err) {
+    Logger.log(`onStatusPendingApproval FAILED for row ${range.getRow()}: ${err.message}`);
+    appendEmailLog_(range.getSheet().getParent(), {
+      row: range.getRow(),
+      requestNo: '',
+      eventType: 'Approval Request',
+      recipient: '',
+      subject: '',
+      notes: `Error: ${err.message}`
+    });
+  }
+}
+
+/**
+ * Creates a one-time token per approval action and notifies every approver.
+ */
+function sendApprovalRequests_(sheet, row) {
+  const ss = sheet.getParent();
+  // Read all 31 columns (A:AE) so Col AD (index 29) and Col AE (index 30) are included
+  const values = sheet.getRange(row, 1, 1, 31).getDisplayValues()[0];
+  const requestNo = String(values[COL_IDX.requestNo] || '').trim();
+  if (!requestNo) throw new Error(`Row ${row} has no Request No.`);
+
+  const formSheet = ss.getSheetByName('Form Responses');
+  const formRowNum = row - 5;
+  const formRowValues = (formSheet && formRowNum >= 2 && formRowNum <= formSheet.getLastRow())
+    ? formSheet.getRange(formRowNum, 1, 1, 24).getDisplayValues()[0] // A:X
+    : [];
+
+  const resolvedEmail = resolveFormApproverEmail_(ss, formRowValues, values);
+  const approverName = String(formRowValues[21] || values[28] || resolvedEmail || 'Approver').trim();
+  const approverPhone = getRowApproverPhone_(ss, formRowValues, values) || getApproverPhoneByEmail_(ss, resolvedEmail);
+
+  const approvers = resolvedEmail
+    ? [{ name: approverName, email: resolvedEmail, phone: approverPhone }]
+    : getApprovers_(ss).map(function (a) {
+        return {
+          name: a.name,
+          email: a.email,
+          phone: normalizePhone_(a.phone) || approverPhone
+        };
+      });
+
+  if (!approvers.length) {
+    appendEmailLog_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Approval Request',
+      recipient: '',
+      subject: '',
+      notes: 'Skipped: no approver email on form, Trip Requests, or Approvers sheet'
+    });
+    return;
+  }
+
+  const details =
+    `Request No: ${requestNo}\nRequester: ${values[COL_IDX.requestedBy]}\n` +
+    `Destination: ${values[COL_IDX.destination]}\nPurpose: ${values[COL_IDX.purpose]}\n` +
+    `Date Needed: ${values[COL_IDX.dateNeeded]}\nTime Out: ${values[COL_IDX.timeOut]}\n`;
+
+  approvers.forEach(function (approver) {
+    const approveUrl = createApprovalLink_(ss.getId(), sheet.getSheetId(), row, requestNo, 'approve');
+    const rejectUrl = createApprovalLink_(ss.getId(), sheet.getSheetId(), row, requestNo, 'reject');
+
+    const subject = `Trip request ${requestNo} - your review`;
+    const body =
+      `Hello ${approver.name},\n\n` +
+      `A vehicle trip request has been submitted and is waiting for a decision from you.\n\n` +
+      `${details}\n` +
+      `To respond, click one of the links below:\n\n` +
+      `Approve this request: ${approveUrl}\n` +
+      `Reject this request: ${rejectUrl}\n\n` +
+      `Each link can be used once and expires in 48 hours. ` +
+      `If you did not expect this message, you can ignore it.\n\n` +
+      `${EMAIL_CONFIG.signOff}`;
+
+    try {
+      GmailApp.sendEmail(approver.email, subject, body, { name: EMAIL_SENDER_NAME });
+      appendEmailLog_(ss, {
+        row: row,
+        requestNo: requestNo,
+        eventType: 'Approval Request Email',
+        recipient: approver.email,
+        subject: subject,
+        notes: 'Sent'
+      });
+    } catch (err) {
+      appendEmailLog_(ss, {
+        row: row,
+        requestNo: requestNo,
+        eventType: 'Approval Request Email',
+        recipient: approver.email,
+        subject: subject,
+        notes: `Error: ${err.message}`
+      });
+    }
+
+    const smsText =
+      `Trip ${requestNo} to ${values[COL_IDX.destination]} on ${values[COL_IDX.dateNeeded]} needs approval. ` +
+      `Approve: ${approveUrl} Reject: ${rejectUrl}`;
+
+    notifySms_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Approval Request',
+      phone: approver.phone || approverPhone,
+      name: approver.name,
+      message: smsText,
+      dedupeKey: `approval-sms:${sheet.getSheetId()}:${row}:${approver.email.toLowerCase()}`,
+      bypassCache: true
+    });
+  });
+}
+
+/**
+ * Reads approvers from the Approvers sheet (Name, Email, Phone).
+ */
+function getApprovers_(ss) {
+  const target = APPROVAL_CONFIG.approversSheet.trim().toLowerCase();
+  const sh = ss.getSheets().filter(function (s) {
+    return s.getName().trim().toLowerCase() === target;
+  })[0];
+  if (!sh || sh.getLastRow() < 2) return [];
+
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getDisplayValues();
+  return data
+    .map(function (r) {
+      return { name: String(r[0]).trim(), email: String(r[1]).trim(), phone: String(r[2]).trim() };
+    })
+    .filter(function (a) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a.email); });
+}
+
+function testApprovalRow7() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(APPROVAL_CONFIG.tripSheet);
+  if (!sheet) throw new Error(`Sheet "${APPROVAL_CONFIG.tripSheet}" not found.`);
+  sendApprovalRequests_(sheet, 7);
+  Logger.log('testApprovalRow7: finished. Check the Email Log tab for results.');
+}
+
+function getApproverPhoneByEmail_(ss, email) {
+  const sh = ss.getSheetByName(APPROVAL_CONFIG.approversSheet);
+  if (!sh || sh.getLastRow() < 2) return '';
+  const target = String(email || '').trim().toLowerCase();
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getDisplayValues();
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][1] || '').trim().toLowerCase() === target) {
+      return String(data[i][2] || '').trim();
+    }
+  }
+  return '';
+}
+
+function getFallbackApproverPhone_(ss) {
+  const sh = ss.getSheetByName(APPROVAL_CONFIG.approversSheet);
+  if (!sh) return '';
+  return String(sh.getRange('C2').getDisplayValue() || '').trim();
+}
+
+function getRowApproverPhone_(ss, formRowValues, tripRowValues) {
+  const candidates = [
+    tripRowValues && tripRowValues[30], // Trip Requests Col AE (index 30)
+    formRowValues && formRowValues[19], // Form Responses Col T (index 19)
+    getFallbackApproverPhone_(ss)
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    const normalized = normalizePhone_(candidates[i]);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function createApprovalLink_(spreadsheetId, sheetId, row, requestNo, action) {
+  const token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
+  const record = {
+    spreadsheetId: spreadsheetId,
+    sheetId: sheetId,
+    row: row,
+    requestNo: requestNo,
+    action: action,
+    expiresAt: Date.now() + APPROVAL_CONFIG.tokenTtlMinutes * 60 * 1000,
+    used: false
+  };
+  PropertiesService.getScriptProperties().setProperty(APPROVAL_CONFIG.tokenPrefix + token, JSON.stringify(record));
+  return `${APPROVAL_CONFIG.webAppUrl}?token=${encodeURIComponent(token)}`;
+}
+
+function doGet(e) {
+  const token = e && e.parameter && e.parameter.token ? String(e.parameter.token) : '';
+  try {
+    const result = consumeApprovalToken_(token);
+    return renderApprovalPage_(result.ok ? 'Done' : 'Unable to process', result.message);
+  } catch (err) {
+    console.error(`Approval error: ${err.message}`);
+    return renderApprovalPage_('Error', 'Something went wrong. Please contact the Transport Office.');
+  }
+}
+
+function consumeApprovalToken_(token) {
+  if (!/^[0-9a-f-]{68}$/i.test(token)) return { ok: false, message: 'Invalid link.' };
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const key = APPROVAL_CONFIG.tokenPrefix + token;
+    const raw = props.getProperty(key);
+    if (!raw) return { ok: false, message: 'This link is invalid or has already been used.' };
+
+    const record = JSON.parse(raw);
+    if (record.used) return { ok: false, message: 'This link has already been used.' };
+    if (Date.now() > record.expiresAt) {
+      props.deleteProperty(key);
+      return { ok: false, message: 'This link has expired.' };
+    }
+
+    props.deleteProperty(key);
+
+    const ss = SpreadsheetApp.openById(record.spreadsheetId);
+    const sheet = ss.getSheets().filter(function (s) { return s.getSheetId() === record.sheetId; })[0];
+    if (!sheet) return { ok: false, message: 'Trip sheet not found.' };
+
+    const cell = sheet.getRange(record.row, APPROVAL_CONFIG.statusCol);
+    const currentStatus = String(cell.getDisplayValue()).trim();
+    if (currentStatus.toLowerCase() !== APPROVAL_CONFIG.triggerStatus.toLowerCase()) {
+      return { ok: false, message: `Trip ${record.requestNo} is no longer pending (current status: ${currentStatus}).` };
+    }
+
+    const newStatus = record.action === 'approve' ? APPROVAL_CONFIG.approvedStatus : APPROVAL_CONFIG.rejectedStatus;
+    cell.setValue(newStatus);
+
+    processTripNotifications_(sheet, record.row, { sendRequester: true, oldStatus: APPROVAL_CONFIG.triggerStatus });
+
+    appendEmailLog_(ss, {
+      row: record.row,
+      requestNo: record.requestNo,
+      eventType: 'Approval Decision',
+      recipient: '',
+      subject: '',
+      notes: `Set to ${newStatus}`
+    });
+
+    return { ok: true, message: `Trip ${record.requestNo} has been ${newStatus.toLowerCase()}. You may close this page.` };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function renderApprovalPage_(title, message) {
+  const html = `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:Roboto,Arial,sans-serif;background:#f5f7fa;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:#fff;padding:32px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);max-width:420px;text-align:center}
+h1{font-size:20px;color:#1a73e8;margin:0 0 12px}p{color:#333;margin:0;line-height:1.5}</style></head>
+<body><div class="card"><h1>${escapeHtml_(title)}</h1><p>${escapeHtml_(message)}</p></div></body></html>`;
+  return HtmlService.createHtmlOutput(html).setTitle(title);
+}
+
+function escapeHtml_(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function installApprovalTrigger() {
+  const handler = 'onStatusPendingApproval';
+  const ss = SpreadsheetApp.getActive();
+  const exists = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === handler && String(t.getEventType()) === 'ON_EDIT';
+  });
+  if (exists) {
+    Logger.log(`installApprovalTrigger: On-edit trigger for ${handler} already installed.`);
+    return;
+  }
+  ScriptApp.newTrigger(handler).forSpreadsheet(ss).onEdit().create();
+  Logger.log(`installApprovalTrigger: installed On-edit trigger for ${handler}.`);
+}
+
+function checkApproversPlaceholders_(ss) {
+  const sh = ss.getSheetByName(APPROVAL_CONFIG.approversSheet);
+  if (!sh || sh.getLastRow() < 2) return 0;
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 3).getDisplayValues();
+  let usable = 0;
+  data.forEach(function (r) {
+    const joined = r.join(' ');
+    if (/TODO/i.test(joined) || !joined.trim()) return;
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(r[1]).trim())) usable++;
+  });
+  return usable;
+}
+
+function approvalSetupCheck() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const usable = checkApproversPlaceholders_(ss);
+  Logger.log(`Usable approvers: ${usable}`);
+  Logger.log(`Web app URL set: ${!/PASTE|TODO/i.test(APPROVAL_CONFIG.webAppUrl)}`);
+  const triggerInstalled = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === 'onStatusPendingApproval' && String(t.getEventType()) === 'ON_EDIT';
+  });
+  Logger.log(`On-edit trigger installed: ${triggerInstalled}`);
+}
+
+function createApproversSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(APPROVAL_CONFIG.approversSheet);
+  if (sh) {
+    Logger.log('Approvers tab already exists.');
+    return;
+  }
+  sh = ss.insertSheet(APPROVAL_CONFIG.approversSheet);
+  sh.getRange(1, 1, 1, 3).setValues([['Name', 'Email', 'Phone']]).setFontWeight('bold');
+  sh.getRange(2, 1, 1, 3).setValues([['TODO: Approver name', 'TODO: approver@example.com', 'TODO: 0XXXXXXXXX']]);
+  sh.setFrozenRows(1);
+}
+
+function resendPendingApprovalEmails() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Trip Requests');
+  if (!sheet) {
+    ui.alert("Sheet 'Trip Requests' was not found.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) {
+    ui.alert('No trip request rows found.');
+    return;
+  }
+
+  const rows = sheet.getRange(TRIP_START_ROW, 1, lastRow - TRIP_START_ROW + 1, 31).getDisplayValues();
+  let resentCount = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const sheetRowNum = TRIP_START_ROW + i;
+    const status = String(rows[i][COL_IDX.status] || '').trim().toLowerCase();
+    if (status !== 'pending') continue;
+
+    sendApprovalRequests_(sheet, sheetRowNum);
+    resentCount++;
+  }
+
+  ui.alert(`Resend complete: ${resentCount} Pending row(s) processed with Approve/Reject email + SMS links.`);
+}
+
+function completeOverdueTrips() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(APPROVAL_CONFIG.tripSheet);
+  if (!sheet) return 0;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) return 0;
+
+  const numRows = lastRow - TRIP_START_ROW + 1;
+  const values = sheet.getRange(TRIP_START_ROW, 1, numRows, TRIP_NUM_COLS).getValues();
+  const now = new Date();
+  const activeStatuses = ['allocated', 'approved'];
+  let completed = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const status = String(row[COL_IDX.status] || '').trim().toLowerCase();
+    if (activeStatuses.indexOf(status) === -1) continue;
+
+    const returnValue = row[COL_IDX.returnDateTime];
+    if (!(returnValue instanceof Date) || isNaN(returnValue.getTime())) continue;
+    if (returnValue.getTime() > now.getTime()) continue;
+
+    const sheetRow = TRIP_START_ROW + i;
+    const oldStatus = String(row[COL_IDX.status] || '').trim();
+    sheet.getRange(sheetRow, COL_NUM.status).setValue('Completed');
+    completed++;
+    try {
+      processTripNotifications_(sheet, sheetRow, { sendRequester: true, oldStatus: oldStatus });
+    } catch (err) {
+      Logger.log(`completeOverdueTrips: requester notice failed for row ${sheetRow}: ${err.message}`);
+    }
+  }
+  return completed;
+}
+
+function installOverdueTripTrigger() {
+  const handler = 'completeOverdueTrips';
+  const exists = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === handler && String(t.getEventType()) === 'CLOCK';
+  });
+  if (exists) return;
+  ScriptApp.newTrigger(handler).timeBased().everyMinutes(15).create();
+}
+
+function resolveFormApproverEmail_(ss, formRowValues, tripRowValues) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const formColX = String((formRowValues && formRowValues[23]) || '').trim();
+  if (emailRegex.test(formColX)) return formColX;
+  const tripColAD = String((tripRowValues && tripRowValues[29]) || '').trim();
+  if (emailRegex.test(tripColAD)) return tripColAD;
+  const approversSheet = ss.getSheetByName('Approvers');
+  const fallback = approversSheet
+    ? String(approversSheet.getRange('B2').getValue() || '').trim()
+    : '';
+  return emailRegex.test(fallback) ? fallback : '';
+}
+
+function isValidEmail_(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function getFallbackApproverEmail_(ss) {
+  const approversSheet = ss.getSheetByName('Approvers');
+  if (!approversSheet) return '';
+  return String(approversSheet.getRange('B2').getValue() || '').trim();
+}
+
+function resendPendingNotifications() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Trip Requests');
+  if (!sheet) {
+    ui.alert("Sheet 'Trip Requests' was not found.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) {
+    ui.alert('No trip request rows found.');
+    return;
+  }
+
+  const rows = sheet.getRange(TRIP_START_ROW, 1, lastRow - TRIP_START_ROW + 1, 31).getDisplayValues();
+  let processedCount = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const sheetRowNum = TRIP_START_ROW + i;
+    const row = rows[i];
+
+    const requestId = String(row[COL_IDX.requestNo] || '').trim();
+    const requesterName = String(row[COL_IDX.requestedBy] || '').trim();
+    const destination = String(row[COL_IDX.destination] || '').trim();
+    const dateNeeded = String(row[COL_IDX.dateNeeded] || '').trim();
+    const status = String(row[COL_IDX.status] || '').trim();
+    const driverName = String(row[COL_IDX.driver] || '').trim();
+
+    if (status.toLowerCase() !== 'pending') continue;
+
+    // 1. Send Approver Email + SMS with Approve/Reject links
+    sendApprovalRequests_(sheet, sheetRowNum);
+
+    // 2. Driver SMS (Col M)
+    if (driverName && isValidDriverName_(driverName)) {
+      notifySms_(ss, {
+        row: sheetRowNum,
+        requestNo: requestId,
+        eventType: 'Driver (Resend)',
+        phone: getDriverPhoneByName_(ss, driverName),
+        name: driverName,
+        message: `Trip ${requestId} (${status}) assigned to ${driverName}: ${requesterName || 'Requester'} to ${destination || 'Destination'} on ${dateNeeded}.`,
+        bypassCache: true
+      });
+    }
+    processedCount++;
+  }
+
+  ui.alert(`Resend finished: ${processedCount} Pending row(s) notified.`);
+}
+
+function onTransportFormSubmit(e) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripSheet = ss.getSheetByName(APPROVAL_CONFIG.tripSheet);
+  const formSheet = ss.getSheetByName('Form Responses');
+  if (!tripSheet || !formSheet) {
+    Logger.log('onTransportFormSubmit: missing Trip Requests or Form Responses sheet.');
+    return;
+  }
+
+  const formRow = (e && e.range && e.range.getSheet().getName() === 'Form Responses')
+    ? e.range.getRow()
+    : formSheet.getLastRow();
+  if (formRow < 2) return;
+
+  const tripRow = formRow + 5;
+  SpreadsheetApp.flush();
+
+  const rowValues = tripSheet.getRange(tripRow, 1, 1, 31).getDisplayValues()[0]; // A:AE
+  const formRowValues = formSheet.getRange(formRow, 1, 1, 24).getDisplayValues()[0]; // A:X
+  const requestNo = String(rowValues[COL_IDX.requestNo] || '').trim();
+  if (!requestNo) {
+    Logger.log(`onTransportFormSubmit: row ${tripRow} has no Request No.`);
+    return;
+  }
+
+  const approverEmail = resolveFormApproverEmail_(ss, formRowValues, rowValues);
+  const approverName = String(formRowValues[21] || rowValues[28] || approverEmail || 'Approver').trim();
+  const approverPhone = getRowApproverPhone_(ss, formRowValues, rowValues) || getApproverPhoneByEmail_(ss, approverEmail);
+
+  if (!approverEmail) {
+    appendEmailLog_(ss, {
+      row: tripRow,
+      requestNo: requestNo,
+      eventType: 'Approval Request (Form Submit)',
+      recipient: '',
+      subject: '',
+      notes: 'Skipped: no approver email on form, Trip Requests, or Approvers sheet'
+    });
+  } else {
+    const approveUrl = createApprovalLink_(ss.getId(), tripSheet.getSheetId(), tripRow, requestNo, 'approve');
+    const rejectUrl = createApprovalLink_(ss.getId(), tripSheet.getSheetId(), tripRow, requestNo, 'reject');
+
+    const details =
+      `Request No: ${requestNo}\n` +
+      `Requester: ${rowValues[COL_IDX.requestedBy]}\n` +
+      `Destination: ${rowValues[COL_IDX.destination]}\n` +
+      `Purpose: ${rowValues[COL_IDX.purpose]}\n` +
+      `Date Needed: ${rowValues[COL_IDX.dateNeeded]}\n` +
+      `Time Out: ${rowValues[COL_IDX.timeOut]}\n`;
+
+    const subject = `Trip request ${requestNo} - your review`;
+    const body =
+      `Hello ${approverName},\n\n` +
+      `A vehicle trip request has been submitted and is waiting for a decision from you.\n\n` +
+      `${details}\n` +
+      `To respond, click one of the links below:\n\n` +
+      `Approve this request: ${approveUrl}\n` +
+      `Reject this request: ${rejectUrl}\n\n` +
+      `Each link can be used once and expires in 48 hours. ` +
+      `If you did not expect this message, you can ignore it.\n\n` +
+      `${EMAIL_CONFIG.signOff}`;
+
+    try {
+      GmailApp.sendEmail(approverEmail, subject, body, { name: EMAIL_SENDER_NAME });
+      appendEmailLog_(ss, {
+        row: tripRow,
+        requestNo: requestNo,
+        eventType: 'Approval Request Email (Form Submit)',
+        recipient: approverEmail,
+        subject: subject,
+        notes: 'Sent'
+      });
+    } catch (err) {
+      appendEmailLog_(ss, {
+        row: tripRow,
+        requestNo: requestNo,
+        eventType: 'Approval Request Email (Form Submit)',
+        recipient: approverEmail,
+        subject: subject,
+        notes: `Error: ${err.message}`
+      });
+    }
+
+    const smsText =
+      `Trip ${requestNo} to ${rowValues[COL_IDX.destination]} on ${rowValues[COL_IDX.dateNeeded]} needs approval. ` +
+      `Approve: ${approveUrl} Reject: ${rejectUrl}`;
+
+    notifySms_(ss, {
+      row: tripRow,
+      requestNo: requestNo,
+      eventType: 'Approval Request (Form Submit)',
+      phone: approverPhone,
+      name: approverName,
+      message: smsText,
+      dedupeKey: `form-sms:${tripSheet.getSheetId()}:${tripRow}:${approverEmail.toLowerCase()}`,
+      bypassCache: true
+    });
+  }
+}
+
+function installFormSubmitTrigger() {
+  const handler = 'onTransportFormSubmit';
+  const ss = SpreadsheetApp.getActive();
+  const exists = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === handler && String(t.getEventType()) === 'ON_FORM_SUBMIT';
+  });
+  if (exists) return;
+  ScriptApp.newTrigger(handler).forSpreadsheet(ss).onFormSubmit().create();
+}
+
+function getDriverPhoneByName_(ss, driverName) {
+  if (!driverName) return '';
+  const driversSheet = ss.getSheetByName('Drivers');
+  if (!driversSheet || driversSheet.getLastRow() < 2) return '';
+
+  const target = String(driverName).trim().toLowerCase();
+  const data = driversSheet.getRange(2, 2, driversSheet.getLastRow() - 1, 6).getValues(); // B2:G{lastRow}
+
+  for (let i = 0; i < data.length; i++) {
+    const nameVal = String(data[i][0] || '').trim().toLowerCase();
+    if (nameVal === target) {
+      return String(data[i][5] || '').trim(); // Col G relative to Col B is index 5
+    }
+  }
+  return '';
+}

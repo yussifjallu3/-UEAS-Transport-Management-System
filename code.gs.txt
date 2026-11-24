@@ -1,0 +1,1621 @@
+/**
+ * Trip Request & Driver Notification System (Email + Arkesel SMS)
+ * Aligned to Trip Requests columns A..S (rows 7+):
+ *   A (0): Request No. | C (2): Requested By | D (3): Phone / WhatsApp
+ *   F (5): Purpose     | G (6): Destination  | H (7): Date Needed
+ *   I (8): Time Out    | K (10): Status      | L (11): Vehicle Allocated
+ *   M (12): Driver Allocated | O (14): Remarks | P (15): Requester Email
+ *   S (18): Driver Email
+ *
+ * SETUP:
+ * 1. Extensions -> Apps Script -> Project Settings -> Script Properties:
+ *    add ARKESEL_API_KEY = your Arkesel API key.
+ * 2. Paste this code, save, and run diagnoseSetup() or testArkeselSms() once to authorize.
+ * 3. Triggers -> + Add Trigger:
+ *    - Event source: From spreadsheet | Event type: On edit -> notifyOnStatusChange
+ *    - (Optional) Time-driven day timer -> sendDailyDriverDigest
+ *    - (Optional) Time-driven day timer -> archiveCompletedTrips
+ */
+
+const TRIP_START_ROW = 7;
+const TRIP_NUM_COLS = 19; // Columns A..S
+
+// 0-based column indices in Trip Requests (A=0 .. S=18)
+const COL_IDX = {
+  requestNo: 0,      // A
+  requestedBy: 2,    // C
+  phone: 3,          // D
+  purpose: 5,        // F
+  destination: 6,    // G
+  dateNeeded: 7,     // H
+  timeOut: 8,        // I
+  status: 10,        // K
+  vehicle: 11,       // L
+  driver: 12,        // M
+  remarks: 14,       // O
+  requesterEmail: 15,// P
+  driverEmail: 18,   // S
+  returnDateTime: 19 // T (expected return date/time; used by completeOverdueTrips)
+};
+
+// 1-based column numbers in Trip Requests for onEdit / setValue
+const COL_NUM = {
+  destination: 7,    // G
+  dateNeeded: 8,     // H
+  timeOut: 9,        // I
+  status: 11,        // K
+  vehicle: 12,       // L
+  driver: 13,        // M
+  driverEmail: 19    // S
+};
+
+const OVERLAP_WINDOW_MINUTES = 120; // Flag Time Out conflicts within 2 hours (120 mins)
+const DEBUG_TRACE = true;
+const TRANSPORT_OFFICE_EMAIL = '';
+const EMAIL_SENDER_NAME = 'TRANSPORT_OFFICE (UEAS-Trip)';
+
+const SMS_CONFIG = {
+  enabled: true,
+  senderId: 'UEAS-Trip',
+  countryCode: '233',
+  requesterPhoneColIndex: COL_IDX.phone, // Col D (index 3)
+  driversPhoneColIndex: 8,               // Drivers sheet Col I (0-based index 8)
+  apiUrl: 'https://sms.arkesel.com/api/v2/sms/send',
+  balanceUrl: 'https://sms.arkesel.com/api/v2/clients/balance-details',
+
+  templates: {
+    requesterApproved:  'Hello {name}, your trip request {requestNo} to {destination} on {dateNeeded} has been APPROVED. Vehicle: {vehicle}. Driver: {driver}.',
+    requesterAllocated: 'Hello {name}, trip {requestNo} has been allocated. Vehicle: {vehicle}. Driver: {driver}. Date: {dateNeeded} {timeOut}.',
+    requesterRejected:  'Hello {name}, your trip request {requestNo} was not approved. Please visit the Transport Office for details.',
+    requesterCompleted: 'Hello {name}, thank you for using our vehicle service. We would appreciate your feedback.',
+    requesterDefault:   'Hello {name}, your trip request {requestNo} status is now: {status}.',
+    driverAssigned:     'Hello {driver}, you are assigned to trip {requestNo}: {destination} on {dateNeeded} at {timeOut}. Vehicle: {vehicle}.',
+    driverRevoked:      'Hello {driver}, you are no longer assigned to trip {requestNo} ({destination}, {dateNeeded}). {reason}',
+    driverDigest:       'Hello {driver}, you have {count} trip(s) in the next 24h. Check your email for details.'
+  }
+};
+
+const EMAIL_CONFIG = {
+  officeName: 'General Administration - Transport Office',
+  signOff:
+    'Best regards,\n' +
+    'General Administration - Transport Office\n' +
+    'Fleet & Logistics Operations',
+  feedbackUrl: '',
+
+  subjects: {
+    requesterStatus: 'Trip Request [{requestNo}] Status Update: {status}',
+    driverAssigned: 'Trip Assignment Alert [{requestNo}]: {destination} on {dateNeeded}',
+    driverRevoked: 'Trip Assignment Revoked [{requestNo}]: {destination} on {dateNeeded}',
+    officeConflict: 'Double-Booking Alert [{requestNo}]: Conflict on {dateNeeded} ({timeOut})',
+    driverDigest: 'Upcoming 24-Hour Trip Schedule ({count} Trip{plural})'
+  },
+
+  requesterBodies: {
+    rejected:
+      'Dear {requesterName},\n\n' +
+      'We wish to inform you that your vehicle request was not approved. ' +
+      'Please visit the {officeName} to discuss the reason for the rejection.\n\n' +
+      '{tripDetails}{remarksLine}\n' +
+      '{signOff}',
+
+    approved:
+      'Dear {requesterName},\n\n' +
+      'We are pleased to inform you that your vehicle request has been approved.\n\n' +
+      'Please proceed with your trip arrangements as scheduled. We wish you a safe and successful trip.\n\n' +
+      '{tripDetails}' +
+      '- Vehicle Allocated: {vehicle}\n' +
+      '- Driver Allocated: {driver}\n' +
+      '{remarksLine}\n' +
+      '{signOff}',
+
+    allocated:
+      'Dear {requesterName},\n\n' +
+      'Your trip request has been allocated. Please find the assigned vehicle and driver below.\n\n' +
+      '{tripDetails}' +
+      '- Vehicle Allocated: {vehicle}\n' +
+      '- Driver Allocated: {driver}\n' +
+      '{remarksLine}\n' +
+      '{signOff}',
+
+    completed:
+      'Dear {requesterName},\n\n' +
+      'Thank you for using our vehicle service. We value your experience and would appreciate your feedback or evaluation of the service provided. ' +
+      'Your comments will help us improve our services.\n' +
+      '{feedbackLine}\n' +
+      'Thank you.\n\n' +
+      '{signOff}',
+
+    default:
+      'Dear {requesterName},\n\n' +
+      'Your trip request status has been updated to: {status}.\n\n' +
+      '{tripDetails}' +
+      'Please be informed that your vehicle request has been {status}. ' +
+      'Kindly report to the {officeName} for the reason and assistance with rebooking.\n\n' +
+      '{remarksLine}\n' +
+      '{signOff}'
+  },
+
+  driverBodies: {
+    assigned:
+      'Dear {driver},\n\n' +
+      'You have been assigned to a scheduled trip. Please review the assignment details below:\n\n' +
+      '{tripDetails}' +
+      '- Assigned Vehicle: {vehicle}\n' +
+      '- Trip Status: {status}\n' +
+      '{remarksLine}\n' +
+      'Please ensure the vehicle is inspected and ready before the scheduled time out. ' +
+      'Contact the {officeName} if you have any scheduling conflicts.\n\n' +
+      '{signOff}',
+
+    revoked:
+      'Dear {prevDriverName},\n\n' +
+      'Please be informed that you are no longer assigned to the trip below. {revokeReason}\n\n' +
+      '{tripDetails}' +
+      '- Vehicle: {vehicle}\n' +
+      '- Current Status: {status}\n' +
+      '{remarksLine}\n' +
+      'Please contact the {officeName} if you have any questions.\n\n' +
+      '{signOff}'
+  }
+};
+
+function renderTemplate_(template, vars) {
+  return String(template).replace(/\{(\w+)\}/g, function (_, key) {
+    return Object.prototype.hasOwnProperty.call(vars, key) && vars[key] !== undefined && vars[key] !== null
+      ? String(vars[key])
+      : '';
+  });
+}
+
+function getTransportOfficeEmail_() {
+  const configured = String(TRANSPORT_OFFICE_EMAIL || '').trim();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(configured)) {
+    return configured;
+  }
+  const ownerEmail = String(Session.getEffectiveUser().getEmail() || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail) ? ownerEmail : '';
+}
+
+function normalizePhone_(raw) {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('0')) digits = digits.slice(1);
+  if (digits.length === 9) {
+    digits = (SMS_CONFIG.countryCode || '233') + digits;
+  }
+  return /^233[235]\d{8}$/.test(digits) ? digits : '';
+}
+
+function resolveDriverPhone_(spreadsheet, driverName) {
+  const sh = spreadsheet.getSheetByName('Drivers');
+  if (!sh || sh.getLastRow() < 2) return '';
+  const cols = Math.max(SMS_CONFIG.driversPhoneColIndex + 1, 1);
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, cols).getDisplayValues();
+  const target = String(driverName || '').trim().toLowerCase();
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][0] || '').trim().toLowerCase() === target) {
+      return normalizePhone_(data[i][SMS_CONFIG.driversPhoneColIndex]);
+    }
+  }
+  return '';
+}
+
+function sendArkeselSms_(phone, message) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('ARKESEL_API_KEY');
+  if (!apiKey) return { ok: false, message: 'ARKESEL_API_KEY not set in Script Properties' };
+
+  try {
+    const res = UrlFetchApp.fetch(SMS_CONFIG.apiUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'api-key': apiKey },
+      payload: JSON.stringify({
+        sender: SMS_CONFIG.senderId,
+        message: message,
+        recipients: [phone]
+      }),
+      muteHttpExceptions: true
+    });
+    const code = res.getResponseCode();
+    const text = res.getContentText();
+    let json = {};
+    try { json = JSON.parse(text); } catch (e) { json = {}; }
+
+    if (code >= 200 && code < 300 && String(json.status || '').toLowerCase() === 'success') {
+      return { ok: true, message: 'Sent' };
+    }
+    return { ok: false, message: `HTTP ${code}: ${json.message || text.slice(0, 200)}` };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
+}
+
+function notifySms_(ss, opts) {
+  if (!SMS_CONFIG.enabled) return;
+
+  try {
+    const phone = normalizePhone_(opts.phone);
+    if (!phone) {
+      safeLogSms_(ss, {
+        row: opts.row,
+        requestNo: opts.requestNo,
+        eventType: `SMS ${opts.eventType}`,
+        recipient: opts.name || '',
+        subject: '',
+        notes: `SMS skipped: no valid phone number ("${opts.phone || ''}")`
+      });
+      return;
+    }
+
+    const cache = CacheService.getScriptCache();
+    if (opts.dedupeKey && !opts.bypassCache && cache.get(opts.dedupeKey)) return;
+    if (opts.dedupeKey) cache.put(opts.dedupeKey, 'sending', 300);
+
+    const result = sendArkeselSms_(phone, opts.message);
+    if (!result.ok && opts.dedupeKey) cache.remove(opts.dedupeKey);
+
+    safeLogSms_(ss, {
+      row: opts.row,
+      requestNo: opts.requestNo,
+      eventType: `SMS ${opts.eventType}`,
+      recipient: `${opts.name || ''} <${phone}>`,
+      subject: String(opts.message || '').slice(0, 60),
+      notes: result.ok ? 'Sent' : `Error: ${result.message}`
+    });
+  } catch (err) {
+    console.error(`SMS failure (${opts.eventType}, row ${opts.row}): ${err.message}`);
+    safeLogSms_(ss, {
+      row: opts.row,
+      requestNo: opts.requestNo,
+      eventType: `SMS ${opts.eventType}`,
+      recipient: opts.name || '',
+      subject: '',
+      notes: `Error: ${err.message}`
+    });
+  }
+}
+
+function safeLogSms_(ss, entry) {
+  try {
+    appendEmailLog_(ss, entry);
+  } catch (err) {
+    console.error(`Could not write SMS entry to Email Log: ${err.message} | entry: ${JSON.stringify(entry)}`);
+  }
+}
+
+function menuCheckSmsBalance() {
+  const ui = SpreadsheetApp.getUi();
+  const apiKey = PropertiesService.getScriptProperties().getProperty('ARKESEL_API_KEY');
+  if (!apiKey) {
+    ui.alert('Missing Key', 'Set ARKESEL_API_KEY in Project Settings -> Script Properties.', ui.ButtonSet.OK);
+    return;
+  }
+  try {
+    const res = UrlFetchApp.fetch(SMS_CONFIG.balanceUrl, {
+      headers: { 'api-key': apiKey },
+      muteHttpExceptions: true
+    });
+    ui.alert('Arkesel Balance', res.getContentText().slice(0, 500), ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Balance Error', err.message, ui.ButtonSet.OK);
+  }
+}
+
+function testArkeselSms() {
+  const testPhone = PropertiesService.getScriptProperties().getProperty('TEST_PHONE');
+  if (!testPhone) {
+    Logger.log('Add a Script Property TEST_PHONE (a number you control, e.g. 024XXXXXXX) before running this test.');
+    return;
+  }
+  const phone = normalizePhone_(testPhone);
+  if (!phone) {
+    Logger.log('TEST_PHONE is not a valid phone number: "' + testPhone + '"');
+    return;
+  }
+  const r = sendArkeselSms_(phone, 'Test SMS from Transport Office script.');
+  Logger.log(JSON.stringify(r));
+}
+
+function onOpen(e) {
+  if (!e || !e.source) {
+    Logger.log('Open the spreadsheet to create the Transport Office menu.');
+    return;
+  }
+
+  SpreadsheetApp.getUi()
+    .createMenu('Transport Office')
+    .addItem('Retry Selected Row Notifications', 'menuRetrySelectedRow')
+    .addItem('Retry Specific Row...', 'menuRetryPromptRow')
+    .addItem('Retry All Failed Rows', 'menuRetryAllFailedRows')
+    .addSeparator()
+    .addItem('Run Full System Check', 'runFullSystemCheck')
+    .addSeparator()
+    .addItem('Archive Completed Trips to History', 'menuArchiveCompletedTrips')
+    .addItem('Refresh Double-Booking Highlights', 'menuRefreshConflictHighlights')
+    .addItem('Send Upcoming 24h Driver Digest Now', 'menuSendDailyDriverDigest')
+    .addItem('Check Remaining Email Quota', 'menuCheckEmailQuota')
+    .addItem('Check SMS Balance (Arkesel)', 'menuCheckSmsBalance')
+    .addSeparator()
+    .addItem('Approval: Check Setup', 'approvalSetupCheck')
+    .addItem('Approval: Create Approvers Tab', 'createApproversSheet')
+    .addItem('Approval: Resend Pending Approval Emails', 'resendPendingApprovalEmails')
+    .addItem('Approval: Resend Pending Notifications', 'resendPendingNotifications')
+    .addToUi();
+}
+
+function menuArchiveCompletedTrips() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const archivedCount = archiveCompletedTrips();
+    ui.alert(
+      'Archive Complete',
+      archivedCount > 0
+        ? `Moved ${archivedCount} completed trip(s) from "Trip Requests" to the "History" tab.`
+        : 'No trips with status "Completed" were found in "Trip Requests" (rows 7+).',
+      ui.ButtonSet.OK
+    );
+  } catch (err) {
+    ui.alert('Archive Error', `Failed to archive completed trips: ${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+function archiveCompletedTrips() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripSheet = ss.getSheetByName('Trip Requests');
+  if (!tripSheet) {
+    throw new Error('Missing "Trip Requests" sheet.');
+  }
+
+  const lastRow = tripSheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) return 0;
+
+  const lastCol = Math.max(tripSheet.getLastColumn(), TRIP_NUM_COLS);
+  const numRows = lastRow - (TRIP_START_ROW - 1);
+  const allValues = tripSheet.getRange(TRIP_START_ROW, 1, numRows, lastCol).getValues();
+  const displayValues = tripSheet.getRange(TRIP_START_ROW, 1, numRows, TRIP_NUM_COLS).getDisplayValues();
+
+  const rowsToArchive = [];
+  for (let i = 0; i < numRows; i++) {
+    const status = String(displayValues[i][COL_IDX.status] || '').trim().toLowerCase();
+    if (status === 'completed') {
+      rowsToArchive.push({
+        sheetRow: i + TRIP_START_ROW,
+        rowValues: allValues[i]
+      });
+    }
+  }
+
+  if (rowsToArchive.length === 0) return 0;
+
+  let historySheet = ss.getSheetByName('History');
+  if (!historySheet) {
+    historySheet = ss.insertSheet('History');
+    const headerRow = tripSheet.getRange(6, 1, 1, lastCol).getDisplayValues()[0];
+    const hasHeaders = headerRow.some(cell => String(cell || '').trim() !== '');
+    const headers = hasHeaders
+      ? ['Archived At'].concat(headerRow)
+      : ['Archived At'].concat(Array.from({ length: lastCol }, (_, idx) => `Column ${idx + 1}`));
+    historySheet.appendRow(headers);
+    historySheet.setFrozenRows(1);
+  }
+
+  const tz = Session.getScriptTimeZone();
+  const archivedTimestamp = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+
+  const archivePayload = rowsToArchive.map(item => [archivedTimestamp].concat(item.rowValues));
+  const startDestRow = historySheet.getLastRow() + 1;
+  historySheet
+    .getRange(startDestRow, 1, archivePayload.length, lastCol + 1)
+    .setValues(archivePayload);
+
+  const props = PropertiesService.getScriptProperties();
+  const sheetId = tripSheet.getSheetId();
+  for (let i = rowsToArchive.length - 1; i >= 0; i--) {
+    const r = rowsToArchive[i].sheetRow;
+    props.deleteProperty(`active_driver:${sheetId}:${r}`);
+    tripSheet.deleteRow(r);
+  }
+
+  refreshDoubleBookingHighlights_(tripSheet);
+  return rowsToArchive.length;
+}
+
+function menuRetrySelectedRow() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+
+  if (sheet.getName() !== 'Trip Requests') {
+    ui.alert('Wrong Sheet', 'Please select a cell inside the "Trip Requests" tab first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const row = sheet.getActiveRange().getRow();
+  if (row < TRIP_START_ROW) {
+    ui.alert('Invalid Row', 'Please select row 7 or below in "Trip Requests".', ui.ButtonSet.OK);
+    return;
+  }
+
+  try {
+    retryTripRow(row);
+    ui.alert('Success', `Notifications retried for Row ${row}. Any prior error entries in "Email Log" were marked resolved.`, ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Error', `Failed on Row ${row}: ${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+function menuRetryPromptRow() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    'Retry Trip Notifications',
+    'Enter the row number in "Trip Requests" (7 or greater):',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const row = parseInt(response.getResponseText().trim(), 10);
+  if (isNaN(row) || row < TRIP_START_ROW) {
+    ui.alert('Invalid Input', 'Please enter a valid row number (7 or greater).', ui.ButtonSet.OK);
+    return;
+  }
+
+  try {
+    retryTripRow(row);
+    ui.alert('Success', `Notifications retried for Row ${row}. Any prior error entries in "Email Log" were marked resolved.`, ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert('Error', `Failed on Row ${row}: ${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+function menuRetryAllFailedRows() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripSheet = ss.getSheetByName('Trip Requests');
+  const logSheet = ss.getSheetByName('Email Log');
+
+  if (!tripSheet) {
+    ui.alert('Missing Sheet', 'Could not find the "Trip Requests" sheet.', ui.ButtonSet.OK);
+    return;
+  }
+
+  if (!logSheet || logSheet.getLastRow() < 2) {
+    ui.alert('No Failed Rows', 'No entries found in "Email Log" to retry.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const logData = logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 7).getDisplayValues();
+  const failedRowSet = new Set();
+
+  for (let i = 0; i < logData.length; i++) {
+    const rowNum = parseInt(String(logData[i][1] || '').trim(), 10);
+    const notes = String(logData[i][6] || '').trim();
+    if (!isNaN(rowNum) && rowNum >= TRIP_START_ROW && notes.toLowerCase().startsWith('error:')) {
+      failedRowSet.add(rowNum);
+    }
+  }
+
+  const failedRows = Array.from(failedRowSet).sort((a, b) => a - b);
+  if (failedRows.length === 0) {
+    ui.alert('No Failed Rows', 'No unresolved rows with "Error:" status were found in "Email Log".', ui.ButtonSet.OK);
+    return;
+  }
+
+  let succeeded = 0;
+  const errors = [];
+
+  for (let i = 0; i < failedRows.length; i++) {
+    const r = failedRows[i];
+    try {
+      retryTripRow(r);
+      succeeded++;
+    } catch (err) {
+      errors.push(`Row ${r}: ${err.message}`);
+      if (String(err.message).toLowerCase().includes('service invoked too many times')) {
+        errors.push('Stopped batch retry because daily email quota was reached.');
+        break;
+      }
+    }
+  }
+
+  let summary = `Batch retry finished: ${succeeded} of ${failedRows.length} failed row(s) succeeded and were marked "[Retried & Sent]" in Email Log.`;
+  if (errors.length > 0) {
+    summary += `\n\nIssues:\n• ${errors.join('\n• ')}`;
+  }
+  ui.alert('Batch Retry Summary', summary, ui.ButtonSet.OK);
+}
+
+function markLogErrorsResolvedForRow_(spreadsheet, rowNumber) {
+  const logSheet = spreadsheet.getSheetByName('Email Log');
+  if (!logSheet || logSheet.getLastRow() < 2) return;
+
+  const numRows = logSheet.getLastRow() - 1;
+  const rowsCol = logSheet.getRange(2, 2, numRows, 1).getDisplayValues();
+  const notesRange = logSheet.getRange(2, 7, numRows, 1);
+  const notesCol = notesRange.getDisplayValues();
+  let updated = false;
+
+  for (let i = 0; i < numRows; i++) {
+    const loggedRow = parseInt(String(rowsCol[i][0] || '').trim(), 10);
+    const noteText = String(notesCol[i][0] || '').trim();
+    if (loggedRow === rowNumber && noteText.toLowerCase().startsWith('error:')) {
+      notesCol[i][0] = `[Retried & Sent] ${noteText}`;
+      updated = true;
+    }
+  }
+
+  if (updated) {
+    notesRange.setValues(notesCol);
+  }
+}
+
+function menuRefreshConflictHighlights() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Trip Requests');
+
+  if (!sheet) {
+    ui.alert('Missing Sheet', 'Could not find the "Trip Requests" sheet.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const result = refreshDoubleBookingHighlights_(sheet);
+  const totalConflicts = result.driverConflicts + result.vehicleConflicts;
+  ui.alert(
+    'Highlights Updated',
+    totalConflicts > 0
+      ? `Found ${result.driverConflicts} driver conflict row(s) (Col M) and ${result.vehicleConflicts} vehicle conflict row(s) (Col L). Conflicting cells are highlighted in red.`
+      : 'No same-day / Time Out driver or vehicle conflicts found. All highlights cleared.',
+    ui.ButtonSet.OK
+  );
+}
+
+function menuSendDailyDriverDigest() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const sentCount = sendDailyDriverDigest();
+    ui.alert(
+      'Driver Digest Complete',
+      `Sent ${sentCount} digest email(s) covering trips in the next 24 hours. Check "Email Log" for details.`,
+      ui.ButtonSet.OK
+    );
+  } catch (err) {
+    ui.alert('Digest Error', `Failed to send driver digest: ${err.message}`, ui.ButtonSet.OK);
+  }
+}
+
+function menuCheckEmailQuota() {
+  const ui = SpreadsheetApp.getUi();
+  const remaining = MailApp.getRemainingDailyQuota();
+  ui.alert(
+    'Daily Email Quota',
+    `Remaining Apps Script email recipients today: ${remaining}`,
+    ui.ButtonSet.OK
+  );
+}
+
+function notifyOnStatusChange(e) {
+  if (!e || !e.range) return;
+
+  const range = e.range;
+  const sheet = range.getSheet();
+  const col = range.getColumn();
+  const watchedCols = [
+    COL_NUM.dateNeeded, // 8 (H)
+    COL_NUM.timeOut,    // 9 (I)
+    COL_NUM.status,     // 11 (K)
+    COL_NUM.vehicle,    // 12 (L)
+    COL_NUM.driver      // 13 (M)
+  ];
+
+  if (
+    sheet.getName() !== 'Trip Requests' ||
+    !watchedCols.includes(col) ||
+    range.getNumColumns() !== 1 ||
+    range.getNumRows() !== 1 ||
+    range.getRow() < TRIP_START_ROW
+  ) {
+    return;
+  }
+
+  const row = range.getRow();
+  const newCellVal = String(range.getDisplayValue()).trim();
+  const oldCellVal = e.oldValue === undefined ? '' : String(e.oldValue).trim();
+
+  if (col === COL_NUM.dateNeeded || col === COL_NUM.timeOut || col === COL_NUM.vehicle) {
+    refreshDoubleBookingHighlights_(sheet);
+    if (col === COL_NUM.vehicle && isValidVehicleName_(newCellVal)) {
+      checkAndAlertTransportOfficeConflict_(sheet, row);
+    }
+    if (col !== COL_NUM.vehicle) return;
+  }
+
+  if (col === COL_NUM.status && !newCellVal) return;
+  if (oldCellVal && oldCellVal.toLowerCase() === newCellVal.toLowerCase()) {
+    return;
+  }
+
+  if (col === COL_NUM.driver) {
+    autoFillDriverEmailColS_(sheet, row, newCellVal);
+  }
+
+  refreshDoubleBookingHighlights_(sheet);
+
+  if (col === COL_NUM.status || col === COL_NUM.driver) {
+    processTripNotifications_(sheet, row, {
+      sendRequester: col === COL_NUM.status && Boolean(newCellVal),
+      oldStatus: col === COL_NUM.status ? oldCellVal : '',
+      oldDriver: col === COL_NUM.driver ? oldCellVal : ''
+    });
+  }
+}
+
+function retryTripRow(rowNumber) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Trip Requests');
+  if (!sheet || !rowNumber || rowNumber < TRIP_START_ROW) {
+    throw new Error('Invalid rowNumber or missing "Trip Requests" sheet.');
+  }
+
+  refreshDoubleBookingHighlights_(sheet);
+
+  processTripNotifications_(sheet, rowNumber, {
+    sendRequester: true,
+    oldStatus: 'retry',
+    bypassCache: true
+  });
+
+  markLogErrorsResolvedForRow_(ss, rowNumber);
+}
+
+function retryRow13() {
+  retryTripRow(13);
+}
+
+function diagnoseSetup() {
+  const rowToCheck = 7;
+  const L = [];
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!ss) {
+    L.push('PROBLEM: script is not bound to a spreadsheet (open it via Extensions > Apps Script from the sheet).');
+  } else {
+    L.push('Spreadsheet: ' + ss.getName());
+    L.push('Tabs: ' + ss.getSheets().map(s => '"' + s.getName() + '"').join(', '));
+
+    const sh = ss.getSheetByName('Trip Requests');
+    if (!sh) {
+      L.push('PROBLEM: no tab named exactly "Trip Requests".');
+    } else {
+      const hdr = sh.getRange(6, 1, 1, TRIP_NUM_COLS).getDisplayValues()[0];
+      const val = sh.getRange(rowToCheck, 1, 1, TRIP_NUM_COLS).getDisplayValues()[0];
+      const show = (label, idx) => L.push(`${label} (col ${String.fromCharCode(65 + idx)}) header "${hdr[idx]}" -> row ${rowToCheck} value "${val[idx]}"`);
+      show('Request No', COL_IDX.requestNo);
+      show('Requester', COL_IDX.requestedBy);
+      show('Status', COL_IDX.status);
+      show('Vehicle', COL_IDX.vehicle);
+      show('Driver', COL_IDX.driver);
+      show('Requester email', COL_IDX.requesterEmail);
+      show('Requester phone', COL_IDX.phone);
+      show('Driver email (S)', COL_IDX.driverEmail);
+      L.push('Email looks valid: ' + /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(val[COL_IDX.requesterEmail]).trim()));
+      L.push('Phone normalizes to: "' + normalizePhone_(val[COL_IDX.phone]) + '" (blank = invalid)');
+    }
+  }
+
+  const triggers = ScriptApp.getProjectTriggers();
+  L.push('Installed triggers (' + triggers.length + '): ' +
+    (triggers.map(t => `${t.getHandlerFunction()} [${t.getEventType()}]`).join('; ') || 'NONE'));
+  L.push('On-edit trigger for notifyOnStatusChange present: ' +
+    triggers.some(t => t.getHandlerFunction() === 'notifyOnStatusChange' && String(t.getEventType()) === 'ON_EDIT'));
+
+  L.push('ARKESEL_API_KEY set: ' + Boolean(PropertiesService.getScriptProperties().getProperty('ARKESEL_API_KEY')));
+  L.push('Remaining email quota: ' + MailApp.getRemainingDailyQuota());
+
+  const report = L.join('\n');
+  Logger.log(report);
+  try { SpreadsheetApp.getUi().alert('Diagnostics', report, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) {}
+  return report;
+}
+
+function sendDailyDriverDigest() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tripSheet = ss.getSheetByName('Trip Requests');
+  if (!tripSheet) {
+    throw new Error('Missing "Trip Requests" sheet.');
+  }
+
+  const lastRow = tripSheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) return 0;
+
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+  const cutoff24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const todayKey = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  const tomorrowKey = Utilities.formatDate(cutoff24h, tz, 'yyyy-MM-dd');
+  const windowLabel = `${Utilities.formatDate(now, tz, 'MMM d, h:mm a')} – ${Utilities.formatDate(cutoff24h, tz, 'MMM d, h:mm a')}`;
+
+  const numRows = lastRow - (TRIP_START_ROW - 1);
+  const rows = tripSheet.getRange(TRIP_START_ROW, 1, numRows, TRIP_NUM_COLS).getDisplayValues();
+
+  const digestByDriver = new Map();
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = i + TRIP_START_ROW;
+    const requestNo = String(rows[i][COL_IDX.requestNo] || 'N/A').trim();
+    const requesterName = String(rows[i][COL_IDX.requestedBy] || 'Requester').trim();
+    const purpose = String(rows[i][COL_IDX.purpose] || 'N/A').trim();
+    const destination = String(rows[i][COL_IDX.destination] || 'N/A').trim();
+    const dateNeeded = String(rows[i][COL_IDX.dateNeeded] || '').trim();
+    const timeOut = String(rows[i][COL_IDX.timeOut] || '').trim();
+    const status = String(rows[i][COL_IDX.status] || '').trim();
+    const vehicle = String(rows[i][COL_IDX.vehicle] || 'Pending').trim();
+    const driver = String(rows[i][COL_IDX.driver] || '').trim();
+    const remarks = String(rows[i][COL_IDX.remarks] || '').trim();
+    const colSEmail = String(rows[i][COL_IDX.driverEmail] || '').trim();
+
+    const normStatus = status.toLowerCase();
+    const isActiveAssignment = normStatus === 'approved' || normStatus === 'allocated';
+    if (!isActiveAssignment || !isValidDriverName_(driver)) continue;
+
+    const tripDateTime = buildTripDateTime_(dateNeeded, timeOut);
+    const dateKey = normalizeDateKey_(dateNeeded);
+    let sortTimestamp = Number.MAX_SAFE_INTEGER;
+    let isWithin24Hours = false;
+
+    if (tripDateTime) {
+      isWithin24Hours = tripDateTime.getTime() >= now.getTime() && tripDateTime.getTime() <= cutoff24h.getTime();
+      sortTimestamp = tripDateTime.getTime();
+    } else if (dateKey === todayKey || dateKey === tomorrowKey) {
+      isWithin24Hours = true;
+      sortTimestamp = dateKey === todayKey ? now.getTime() : cutoff24h.getTime();
+    }
+
+    if (!isWithin24Hours) continue;
+
+    const driverEmail = resolveDriverEmail_(ss, driver, colSEmail);
+    if (!driverEmail) {
+      console.warn(`Digest skipped for driver "${driver}" on row ${r}: no valid email.`);
+      continue;
+    }
+
+    const key = driver.toLowerCase();
+    if (!digestByDriver.has(key)) {
+      digestByDriver.set(key, {
+        driverName: driver,
+        email: driverEmail,
+        trips: []
+      });
+    }
+
+    digestByDriver.get(key).trips.push({
+      row: r,
+      requestNo: requestNo,
+      dateNeeded: dateNeeded || 'N/A',
+      timeOut: timeOut || 'N/A',
+      destination: destination,
+      requesterName: requesterName,
+      purpose: purpose,
+      vehicle: vehicle,
+      status: status,
+      remarks: remarks,
+      sortTimestamp: sortTimestamp
+    });
+  }
+
+  let sentCount = 0;
+
+  digestByDriver.forEach(entry => {
+    entry.trips.sort((a, b) => a.sortTimestamp - b.sortTimestamp);
+
+    const subject = renderTemplate_(EMAIL_CONFIG.subjects.driverDigest, {
+      count: entry.trips.length,
+      plural: entry.trips.length === 1 ? '' : 's'
+    });
+
+    const tripBlocks = entry.trips
+      .map((t, idx) =>
+        `${idx + 1}. [${t.requestNo}] Date: ${t.dateNeeded} | Time Out: ${t.timeOut}\n` +
+        `   Destination: ${t.destination}\n` +
+        `   Requester: ${t.requesterName} | Purpose: ${t.purpose}\n` +
+        `   Vehicle: ${t.vehicle} | Status: ${t.status}` +
+        (t.remarks ? `\n   Remarks: ${t.remarks}` : '')
+      )
+      .join('\n\n');
+
+    const body =
+      `Good morning ${entry.driverName},\n\n` +
+      `Here is your scheduled trip digest for the next 24 hours (${windowLabel}):\n\n` +
+      `${tripBlocks}\n\n` +
+      `Please complete pre-trip vehicle checks and depart on time. ` +
+      `Contact the ${EMAIL_CONFIG.officeName} for any schedule updates.\n\n` +
+      `${EMAIL_CONFIG.signOff}`;
+
+    try {
+      GmailApp.sendEmail(entry.email, subject, body, { name: EMAIL_SENDER_NAME });
+      sentCount++;
+      appendEmailLog_(ss, {
+        row: entry.trips.map(t => t.row).join(', '),
+        requestNo: entry.trips.map(t => t.requestNo).join(', '),
+        eventType: '24h Driver Digest',
+        recipient: `${entry.driverName} <${entry.email}>`,
+        subject: subject,
+        notes: `Sent (${entry.trips.length} trip(s) in ${windowLabel})`
+      });
+
+      notifySms_(ss, {
+        row: entry.trips.map(t => t.row).join(', '),
+        requestNo: entry.trips.map(t => t.requestNo).join(', '),
+        eventType: '24h Digest',
+        phone: resolveDriverPhone_(ss, entry.driverName),
+        name: entry.driverName,
+        message: renderTemplate_(SMS_CONFIG.templates.driverDigest, {
+          driver: entry.driverName,
+          count: entry.trips.length
+        })
+      });
+    } catch (err) {
+      console.error(`Failed 24h digest to ${entry.driverName} (${entry.email}): ${err.message}`);
+      appendEmailLog_(ss, {
+        row: entry.trips.map(t => t.row).join(', '),
+        requestNo: entry.trips.map(t => t.requestNo).join(', '),
+        eventType: '24h Driver Digest',
+        recipient: `${entry.driverName} <${entry.email}>`,
+        subject: subject,
+        notes: `Error: ${err.message}`
+      });
+      throw err;
+    }
+  });
+
+  return sentCount;
+}
+
+function buildTripDateTime_(dateNeededStr, timeOutStr) {
+  const dateKey = normalizeDateKey_(dateNeededStr);
+  const mins = parseTimeToMinutes_(timeOutStr);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey) || mins === null) {
+    return null;
+  }
+
+  const parts = dateKey.split('-').map(n => parseInt(n, 10));
+  const hours = Math.floor(mins / 60);
+  const minutes = mins % 60;
+  return new Date(parts[0], parts[1] - 1, parts[2], hours, minutes, 0, 0);
+}
+
+function autoFillDriverEmailColS_(tripSheet, row, driverName) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const colSCell = tripSheet.getRange(row, COL_NUM.driverEmail);
+
+  if (!isValidDriverName_(driverName)) {
+    colSCell.setValue('');
+    return;
+  }
+
+  const resolvedEmail = resolveDriverEmail_(tripSheet.getParent(), driverName, '');
+  if (resolvedEmail && emailRegex.test(resolvedEmail)) {
+    colSCell.setValue(resolvedEmail);
+  }
+}
+
+function checkAndAlertTransportOfficeConflict_(tripSheet, row) {
+  const ss = tripSheet.getParent();
+  const officeEmail = getTransportOfficeEmail_();
+  if (!officeEmail) return '';
+
+  const values = tripSheet.getRange(row, 1, 1, TRIP_NUM_COLS).getDisplayValues()[0];
+  const requestNo = values[COL_IDX.requestNo] || `Row ${row}`;
+  const requesterName = values[COL_IDX.requestedBy] || 'Requester';
+  const destination = values[COL_IDX.destination] || 'N/A';
+  const dateNeeded = String(values[COL_IDX.dateNeeded] || '').trim();
+  const timeOut = String(values[COL_IDX.timeOut] || '').trim();
+  const status = String(values[COL_IDX.status] || '').trim();
+  const vehicle = String(values[COL_IDX.vehicle] || '').trim();
+  const driver = String(values[COL_IDX.driver] || '').trim();
+
+  const inactiveStatuses = ['rejected', 'cancelled', 'canceled', 'revoked', 'completed'];
+  if (inactiveStatuses.includes(status.toLowerCase())) return '';
+
+  const dConflicts = findResourceConflicts_(tripSheet, row, 'driver', driver, dateNeeded, timeOut);
+  const vConflicts = findResourceConflicts_(tripSheet, row, 'vehicle', vehicle, dateNeeded, timeOut);
+
+  const warnings = [];
+  if (dConflicts.length) warnings.push(`Driver (${driver}) overlap: ${dConflicts.join('; ')}`);
+  if (vConflicts.length) warnings.push(`Vehicle (${vehicle}) overlap: ${vConflicts.join('; ')}`);
+
+  if (warnings.length === 0) return '';
+
+  const conflictSummary = warnings.join(' | ');
+  const cache = CacheService.getScriptCache();
+  const dedupeKey = `office-conflict:${tripSheet.getSheetId()}:${row}:${driver.toLowerCase()}:${vehicle.toLowerCase()}:${dateNeeded}:${timeOut}`;
+
+  if (cache.get(dedupeKey)) {
+    return conflictSummary;
+  }
+
+  const subject = renderTemplate_(EMAIL_CONFIG.subjects.officeConflict, {
+    requestNo: requestNo,
+    dateNeeded: dateNeeded || 'N/A',
+    timeOut: timeOut || 'N/A'
+  });
+
+  const body =
+    `${EMAIL_CONFIG.officeName} Alert,\n\n` +
+    `A scheduling overlap was detected on Trip Requests Row ${row}:\n\n` +
+    `- Request No: ${requestNo}\n` +
+    `- Requester: ${requesterName}\n` +
+    `- Destination: ${destination}\n` +
+    `- Date Needed: ${dateNeeded || 'N/A'}\n` +
+    `- Time Out: ${timeOut || 'N/A'}\n` +
+    `- Status: ${status || 'Pending'}\n` +
+    `- Assigned Driver: ${driver || 'Unassigned'}\n` +
+    `- Assigned Vehicle: ${vehicle || 'Unassigned'}\n\n` +
+    `Detected Conflict(s):\n• ${warnings.join('\n• ')}\n\n` +
+    `Conflicting cells have been highlighted in red on the "Trip Requests" sheet.\n\n` +
+    `${EMAIL_CONFIG.signOff}`;
+
+  cache.put(dedupeKey, 'sending', 300);
+  try {
+    GmailApp.sendEmail(officeEmail, subject, body, { name: EMAIL_SENDER_NAME });
+    appendEmailLog_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Transport Office Conflict Alert',
+      recipient: officeEmail,
+      subject: subject,
+      notes: `Sent | ${conflictSummary}`
+    });
+  } catch (err) {
+    cache.remove(dedupeKey);
+    appendEmailLog_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Transport Office Conflict Alert',
+      recipient: officeEmail,
+      subject: subject,
+      notes: `Error: ${err.message} | ${conflictSummary}`
+    });
+  }
+
+  return conflictSummary;
+}
+
+function refreshDoubleBookingHighlights_(tripSheet) {
+  const lastRow = tripSheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) return { driverConflicts: 0, vehicleConflicts: 0 };
+
+  const numRows = lastRow - (TRIP_START_ROW - 1);
+  const data = tripSheet.getRange(TRIP_START_ROW, 1, numRows, TRIP_NUM_COLS).getDisplayValues();
+  const vehicleRange = tripSheet.getRange(TRIP_START_ROW, COL_NUM.vehicle, numRows, 1);
+  const driverRange = tripSheet.getRange(TRIP_START_ROW, COL_NUM.driver, numRows, 1);
+
+  const vehicleBg = [];
+  const vehicleNotes = [];
+  const driverBg = [];
+  const driverNotes = [];
+
+  let driverConflicts = 0;
+  let vehicleConflicts = 0;
+  const inactiveStatuses = ['rejected', 'cancelled', 'canceled', 'revoked', 'completed'];
+
+  for (let i = 0; i < data.length; i++) {
+    const dateNeeded = String(data[i][COL_IDX.dateNeeded] || '').trim();
+    const timeOut = String(data[i][COL_IDX.timeOut] || '').trim();
+    const status = String(data[i][COL_IDX.status] || '').trim().toLowerCase();
+    const vehicle = String(data[i][COL_IDX.vehicle] || '').trim();
+    const driver = String(data[i][COL_IDX.driver] || '').trim();
+
+    if (inactiveStatuses.includes(status)) {
+      driverBg.push([null]);
+      driverNotes.push(['']);
+      vehicleBg.push([null]);
+      vehicleNotes.push(['']);
+      continue;
+    }
+
+    if (isValidDriverName_(driver)) {
+      const dConflicts = findResourceConflictsFromData_(data, i, 'driver', driver, dateNeeded, timeOut);
+      if (dConflicts.length > 0) {
+        driverConflicts++;
+        driverBg.push(['#f4cccc']);
+        driverNotes.push([`Driver double-booking warning (${dateNeeded} @ ${timeOut || 'N/A'}):\n• ${dConflicts.join('\n• ')}`]);
+      } else {
+        driverBg.push([null]);
+        driverNotes.push(['']);
+      }
+    } else {
+      driverBg.push([null]);
+      driverNotes.push(['']);
+    }
+
+    if (isValidVehicleName_(vehicle)) {
+      const vConflicts = findResourceConflictsFromData_(data, i, 'vehicle', vehicle, dateNeeded, timeOut);
+      if (vConflicts.length > 0) {
+        vehicleConflicts++;
+        vehicleBg.push(['#f4cccc']);
+        vehicleNotes.push([`Vehicle double-booking warning (${dateNeeded} @ ${timeOut || 'N/A'}):\n• ${vConflicts.join('\n• ')}`]);
+      } else {
+        vehicleBg.push([null]);
+        vehicleNotes.push(['']);
+      }
+    } else {
+      vehicleBg.push([null]);
+      vehicleNotes.push(['']);
+    }
+  }
+
+  driverRange.setBackgrounds(driverBg);
+  driverRange.setNotes(driverNotes);
+  vehicleRange.setBackgrounds(vehicleBg);
+  vehicleRange.setNotes(vehicleNotes);
+
+  return { driverConflicts: driverConflicts, vehicleConflicts: vehicleConflicts };
+}
+
+function findResourceConflicts_(tripSheet, currentRow, resourceType, resourceValue, dateNeededStr, timeOutStr) {
+  const lastRow = tripSheet.getLastRow();
+  if (lastRow < TRIP_START_ROW) return [];
+  const data = tripSheet.getRange(TRIP_START_ROW, 1, lastRow - (TRIP_START_ROW - 1), TRIP_NUM_COLS).getDisplayValues();
+  return findResourceConflictsFromData_(data, currentRow - TRIP_START_ROW, resourceType, resourceValue, dateNeededStr, timeOutStr);
+}
+
+function findResourceConflictsFromData_(data, currentIndex, resourceType, resourceValue, dateNeededStr, timeOutStr) {
+  const conflicts = [];
+  const isDriver = resourceType === 'driver';
+  const isValid = isDriver ? isValidDriverName_(resourceValue) : isValidVehicleName_(resourceValue);
+
+  if (!isValid || !dateNeededStr || dateNeededStr === 'N/A') {
+    return conflicts;
+  }
+
+  const targetVal = String(resourceValue).trim().toLowerCase();
+  const targetDate = normalizeDateKey_(dateNeededStr);
+  if (!targetDate) return conflicts;
+
+  const targetMinutes = parseTimeToMinutes_(timeOutStr);
+  const inactiveStatuses = ['rejected', 'cancelled', 'canceled', 'revoked', 'completed'];
+
+  for (let i = 0; i < data.length; i++) {
+    if (i === currentIndex) continue;
+
+    const r = i + TRIP_START_ROW;
+    const otherReqNo = String(data[i][COL_IDX.requestNo] || `Row ${r}`).trim();
+    const otherDate = normalizeDateKey_(data[i][COL_IDX.dateNeeded]);
+    const otherTimeOut = String(data[i][COL_IDX.timeOut] || '').trim();
+    const otherStatus = String(data[i][COL_IDX.status] || '').trim().toLowerCase();
+    const otherVal = String(data[i][isDriver ? COL_IDX.driver : COL_IDX.vehicle] || '').trim().toLowerCase();
+
+    if (
+      otherVal !== targetVal ||
+      otherDate !== targetDate ||
+      inactiveStatuses.includes(otherStatus)
+    ) {
+      continue;
+    }
+
+    const otherMinutes = parseTimeToMinutes_(otherTimeOut);
+
+    let isTimeOverlap = true;
+    let timeDetail = otherTimeOut ? `Time Out: ${otherTimeOut}` : 'Time Out: Unspecified';
+
+    if (targetMinutes !== null && otherMinutes !== null) {
+      const diffMins = Math.abs(targetMinutes - otherMinutes);
+      isTimeOverlap = diffMins <= OVERLAP_WINDOW_MINUTES;
+      if (isTimeOverlap) {
+        timeDetail = diffMins === 0
+          ? `Exact same Time Out (${otherTimeOut})`
+          : `Time Out ${otherTimeOut} (${diffMins} mins apart)`;
+      }
+    }
+
+    if (isTimeOverlap) {
+      conflicts.push(`${otherReqNo} (Row ${r}, ${timeDetail}, Status: ${data[i][COL_IDX.status] || 'Active'})`);
+    }
+  }
+
+  return conflicts;
+}
+
+function parseTimeToMinutes_(timeStr) {
+  if (!timeStr || timeStr === 'N/A') return null;
+  const clean = String(timeStr).trim().toUpperCase();
+
+  const match = clean.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/);
+  if (!match) return null;
+
+  let hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  const meridiem = match[3] || '';
+
+  if (minutes < 0 || minutes > 59) return null;
+
+  if (meridiem === 'PM' && hours < 12) hours += 12;
+  if (meridiem === 'AM' && hours === 12) hours = 0;
+
+  if (hours < 0 || hours > 23) return null;
+  return hours * 60 + minutes;
+}
+
+function normalizeDateKey_(val) {
+  if (!val) return '';
+  if (Object.prototype.toString.call(val) === '[object Date]' && !isNaN(val.getTime())) {
+    return Utilities.formatDate(val, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  const str = String(val).trim();
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  return str.toLowerCase();
+}
+
+function appendEmailLog_(spreadsheet, entry) {
+  const logSheetName = 'Email Log';
+  let logSheet = spreadsheet.getSheetByName(logSheetName);
+
+  if (!logSheet) {
+    logSheet = spreadsheet.insertSheet(logSheetName);
+    logSheet.appendRow([
+      'Timestamp',
+      'Row',
+      'Request No',
+      'Event Type',
+      'Recipient',
+      'Subject',
+      'Status / Notes'
+    ]);
+    logSheet.setFrozenRows(1);
+  }
+
+  const timestamp = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    'yyyy-MM-dd HH:mm:ss'
+  );
+
+  logSheet.appendRow([
+    timestamp,
+    entry.row || '',
+    entry.requestNo || '',
+    entry.eventType || '',
+    entry.recipient || '',
+    entry.subject || '',
+    entry.notes || ''
+  ]);
+}
+
+function processTripNotifications_(sheet, row, options) {
+  const opts = options || {};
+  const ss = sheet.getParent();
+  const values = sheet.getRange(row, 1, 1, TRIP_NUM_COLS).getDisplayValues()[0];
+
+  const requestNo = values[COL_IDX.requestNo] || 'N/A';
+  const requesterName = values[COL_IDX.requestedBy] || 'Requester';
+  const purpose = values[COL_IDX.purpose] || 'N/A';
+  const destination = values[COL_IDX.destination] || 'N/A';
+  const dateNeeded = values[COL_IDX.dateNeeded] || 'N/A';
+  const timeOut = values[COL_IDX.timeOut] || 'N/A';
+  const status = String(values[COL_IDX.status] || '').trim();
+  const vehicle = values[COL_IDX.vehicle] || 'Pending';
+  const driver = String(values[COL_IDX.driver] || '').trim();
+  const remarks = values[COL_IDX.remarks] || '';
+  const requesterEmail = String(values[COL_IDX.requesterEmail] || '').trim();
+  const driverEmailColS = String(values[COL_IDX.driverEmail] || '').trim();
+  const requesterPhone = values[SMS_CONFIG.requesterPhoneColIndex] || '';
+
+  const normalizedStatus = status.toLowerCase();
+  const cache = CacheService.getScriptCache();
+  const props = PropertiesService.getScriptProperties();
+  const assignmentPropKey = `active_driver:${sheet.getSheetId()}:${row}`;
+
+  const tripDetails =
+    `Trip Details:\n` +
+    `- Request No: ${requestNo}\n` +
+    `- Requester: ${requesterName}\n` +
+    `- Destination: ${destination}\n` +
+    `- Purpose: ${purpose}\n` +
+    `- Date Needed: ${dateNeeded}\n` +
+    `- Time Out: ${timeOut}\n`;
+
+  const remarksLine = remarks ? `- Remarks: ${remarks}\n` : '';
+  const feedbackLine = EMAIL_CONFIG.feedbackUrl
+    ? `\nFeedback Form: ${EMAIL_CONFIG.feedbackUrl}\n`
+    : '';
+
+  const templateVars = {
+    requestNo: requestNo,
+    requesterName: requesterName,
+    purpose: purpose,
+    destination: destination,
+    dateNeeded: dateNeeded,
+    timeOut: timeOut,
+    status: status,
+    vehicle: vehicle,
+    driver: driver || 'Pending',
+    remarks: remarks,
+    remarksLine: remarksLine,
+    feedbackLine: feedbackLine,
+    tripDetails: tripDetails,
+    officeName: EMAIL_CONFIG.officeName,
+    signOff: EMAIL_CONFIG.signOff
+  };
+
+  const skipRequesterSms = normalizedStatus === 'pending' || normalizedStatus === 'completed';
+
+  if (opts.sendRequester && !skipRequesterSms) {
+    const smsTemplateKey = {
+      approved: 'requesterApproved',
+      allocated: 'requesterAllocated',
+      rejected: 'requesterRejected'
+    }[normalizedStatus] || 'requesterDefault';
+
+    notifySms_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: `Requester (${status})`,
+      phone: requesterPhone,
+      name: requesterName,
+      message: renderTemplate_(SMS_CONFIG.templates[smsTemplateKey], {
+        name: requesterName,
+        requestNo: requestNo,
+        destination: destination,
+        dateNeeded: dateNeeded,
+        timeOut: timeOut,
+        vehicle: vehicle,
+        driver: driver || 'Pending',
+        status: status
+      }),
+      dedupeKey: `status-sms:${sheet.getSheetId()}:${row}:${(opts.oldStatus || '').toLowerCase()}:${normalizedStatus}`,
+      bypassCache: opts.bypassCache
+    });
+  }
+
+  if (opts.sendRequester && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(requesterEmail)) {
+    const reqDedupeKey = `status-email:${sheet.getSheetId()}:${row}:${(opts.oldStatus || '').toLowerCase()}:${normalizedStatus}`;
+
+    if (opts.bypassCache || !cache.get(reqDedupeKey)) {
+      const subject = renderTemplate_(EMAIL_CONFIG.subjects.requesterStatus, templateVars);
+      const bodyTemplate =
+        EMAIL_CONFIG.requesterBodies[normalizedStatus] || EMAIL_CONFIG.requesterBodies.default;
+      const body = renderTemplate_(bodyTemplate, templateVars);
+
+      cache.put(reqDedupeKey, 'sending', 300);
+      try {
+        GmailApp.sendEmail(requesterEmail, subject, body, { name: EMAIL_SENDER_NAME });
+        console.log(`Requester email (${status}) sent to ${requesterEmail} for row ${row}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: `Requester (${status})`,
+          recipient: requesterEmail,
+          subject: subject,
+          notes: 'Sent'
+        });
+      } catch (err) {
+        cache.remove(reqDedupeKey);
+        console.error(`Failed requester email for row ${row}: ${err.message}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: `Requester (${status})`,
+          recipient: requesterEmail,
+          subject: subject,
+          notes: `Error: ${err.message}`
+        });
+        throw err;
+      }
+    }
+  }
+
+  if (opts.sendRequester && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(requesterEmail)) {
+    appendEmailLog_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: `Requester (${status})`,
+      recipient: requesterName,
+      subject: '',
+      notes: `Email skipped: no valid requester email in Column P ("${requesterEmail}")`
+    });
+  }
+
+  const isAssignableStatus = normalizedStatus === 'approved' || normalizedStatus === 'allocated';
+  const isRevokingStatus =
+    normalizedStatus === 'rejected' ||
+    normalizedStatus === 'cancelled' ||
+    normalizedStatus === 'canceled' ||
+    normalizedStatus === 'revoked';
+  const isDriverAssigned = isValidDriverName_(driver);
+
+  const storedRaw = props.getProperty(assignmentPropKey);
+  let prevRecord = null;
+  if (storedRaw) {
+    try {
+      prevRecord = JSON.parse(storedRaw);
+    } catch (e) {
+      prevRecord = null;
+    }
+  }
+
+  const prevDriverName = prevRecord && prevRecord.driver ? String(prevRecord.driver).trim() : '';
+  const prevDriverEmail = prevRecord && prevRecord.email ? String(prevRecord.email).trim() : '';
+
+  const currentDriverEmail = isDriverAssigned
+    ? resolveDriverEmail_(ss, driver, driverEmailColS)
+    : null;
+
+  const hasDifferentDriver =
+    prevDriverName &&
+    (!isDriverAssigned || prevDriverName.toLowerCase() !== driver.toLowerCase());
+
+  if (prevDriverName && (hasDifferentDriver || isRevokingStatus)) {
+    const revokeEmail = prevDriverEmail || resolveDriverEmail_(ss, prevDriverName, '');
+    const revokeReason = isRevokingStatus
+      ? `The trip status is now "${status}".`
+      : isDriverAssigned
+        ? `This trip has been reassigned to another driver (${driver}).`
+        : 'Your driver assignment for this trip has been removed/revoked.';
+
+    const revokeDedupeKey = `driver-revoke:${sheet.getSheetId()}:${row}:${prevDriverName.toLowerCase()}:${normalizedStatus}:${driver.toLowerCase()}`;
+    const revokeSubject = renderTemplate_(EMAIL_CONFIG.subjects.driverRevoked, templateVars);
+
+    notifySms_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Driver Revoked/Reassigned',
+      phone: resolveDriverPhone_(ss, prevDriverName),
+      name: prevDriverName,
+      message: renderTemplate_(SMS_CONFIG.templates.driverRevoked, {
+        driver: prevDriverName,
+        requestNo: requestNo,
+        destination: destination,
+        dateNeeded: dateNeeded,
+        reason: revokeReason
+      }),
+      dedupeKey: `driver-revoke-sms:${sheet.getSheetId()}:${row}:${prevDriverName.toLowerCase()}:${normalizedStatus}:${driver.toLowerCase()}`,
+      bypassCache: opts.bypassCache
+    });
+
+    if (revokeEmail && (opts.bypassCache || !cache.get(revokeDedupeKey))) {
+      const revokeBody = renderTemplate_(
+        EMAIL_CONFIG.driverBodies.revoked,
+        Object.assign({}, templateVars, {
+          prevDriverName: prevDriverName,
+          revokeReason: revokeReason,
+          status: status || 'Updated'
+        })
+      );
+
+      cache.put(revokeDedupeKey, 'sending', 300);
+      try {
+        GmailApp.sendEmail(revokeEmail, revokeSubject, revokeBody, { name: EMAIL_SENDER_NAME });
+        console.log(`Driver revocation/reassignment notice sent to ${prevDriverName} (${revokeEmail}) for row ${row}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: 'Driver Revoked/Reassigned',
+          recipient: `${prevDriverName} <${revokeEmail}>`,
+          subject: revokeSubject,
+          notes: `Sent (${revokeReason})`
+        });
+      } catch (err) {
+        cache.remove(revokeDedupeKey);
+        console.error(`Failed revocation notice for row ${row} (${prevDriverName}): ${err.message}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: 'Driver Revoked/Reassigned',
+          recipient: `${prevDriverName} <${revokeEmail}>`,
+          subject: revokeSubject,
+          notes: `Error: ${err.message}`
+        });
+        throw err;
+      }
+    }
+
+    if (isRevokingStatus || !isDriverAssigned) {
+      props.deleteProperty(assignmentPropKey);
+    }
+  }
+
+  if (isAssignableStatus && isDriverAssigned) {
+    props.setProperty(
+      assignmentPropKey,
+      JSON.stringify({ driver: driver, email: currentDriverEmail || '' })
+    );
+
+    notifySms_(ss, {
+      row: row,
+      requestNo: requestNo,
+      eventType: 'Driver Assigned',
+      phone: resolveDriverPhone_(ss, driver),
+      name: driver,
+      message: renderTemplate_(SMS_CONFIG.templates.driverAssigned, {
+        driver: driver,
+        requestNo: requestNo,
+        destination: destination,
+        dateNeeded: dateNeeded,
+        timeOut: timeOut,
+        vehicle: vehicle
+      }),
+      dedupeKey: `driver-alert-sms:${sheet.getSheetId()}:${row}:${driver.toLowerCase()}`,
+      bypassCache: opts.bypassCache || !prevDriverName || prevDriverName.toLowerCase() !== driver.toLowerCase()
+    });
+
+    if (!currentDriverEmail) {
+      const warnMsg = `No valid driver email found (Col S: "${driverEmailColS}", Drivers Col H) for driver "${driver}" on row ${row}`;
+      console.warn(warnMsg);
+      appendEmailLog_(ss, {
+        row: row,
+        requestNo: requestNo,
+        eventType: 'Driver Alert Skipped',
+        recipient: driver,
+        subject: '',
+        notes: warnMsg
+      });
+      return;
+    }
+
+    const conflictSummary = checkAndAlertTransportOfficeConflict_(sheet, row);
+    const conflictNote = conflictSummary ? `WARNING - ${conflictSummary}` : '';
+    const officeEmail = getTransportOfficeEmail_();
+
+    const isNewOrReassignedDriver =
+      !prevDriverName || prevDriverName.toLowerCase() !== driver.toLowerCase();
+    const driverDedupeKey = `driver-alert:${sheet.getSheetId()}:${row}:${driver.toLowerCase()}`;
+    const driverSubject = renderTemplate_(EMAIL_CONFIG.subjects.driverAssigned, templateVars);
+
+    if (opts.bypassCache || isNewOrReassignedDriver || !cache.get(driverDedupeKey)) {
+      const driverBody = renderTemplate_(EMAIL_CONFIG.driverBodies.assigned, templateVars);
+
+      const mailOptions = {
+        to: currentDriverEmail,
+        subject: driverSubject,
+        body: driverBody,
+        name: EMAIL_SENDER_NAME
+      };
+      if (conflictSummary && officeEmail && officeEmail.toLowerCase() !== currentDriverEmail.toLowerCase()) {
+        mailOptions.cc = officeEmail;
+      }
+
+      cache.put(driverDedupeKey, 'sending', 300);
+      try {
+        GmailApp.sendEmail(mailOptions);
+        props.setProperty(
+          assignmentPropKey,
+          JSON.stringify({ driver: driver, email: currentDriverEmail })
+        );
+        console.log(`Driver alert sent to ${driver} (${currentDriverEmail}) for row ${row}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: 'Driver Assigned',
+          recipient: `${driver} <${currentDriverEmail}>`,
+          subject: driverSubject,
+          notes: conflictNote ? `Sent (CC: ${officeEmail}) | ${conflictNote}` : 'Sent'
+        });
+      } catch (err) {
+        cache.remove(driverDedupeKey);
+        console.error(`Failed driver alert for row ${row} (${driver}): ${err.message}`);
+        appendEmailLog_(ss, {
+          row: row,
+          requestNo: requestNo,
+          eventType: 'Driver Assigned',
+          recipient: `${driver} <${currentDriverEmail}>`,
+          subject: driverSubject,
+          notes: conflictNote ? `Error: ${err.message} | ${conflictNote}` : `Error: ${err.message}`
+        });
+        throw err;
+      }
+    } else if (conflictNote) {
+      appendEmailLog_(ss, {
+        row: row,
+        requestNo: requestNo,
+        eventType: 'Double-Booking Warning',
+        recipient: `${driver} <${currentDriverEmail}>`,
+        subject: driverSubject,
+        notes: conflictNote
+      });
+    }
+  }
+}
+
+function isValidDriverName_(val) {
+  if (!val) return false;
+  const lower = String(val).trim().toLowerCase();
+  return !['pending', 'none', 'n/a', 'na', 'unassigned', 'revoked', 'cancelled', 'canceled'].includes(lower);
+}
+
+function isValidVehicleName_(val) {
+  if (!val) return false;
+  const lower = String(val).trim().toLowerCase();
+  return !['pending', 'none', 'n/a', 'na', 'unassigned', 'tbd'].includes(lower);
+}
+
+function resolveDriverEmail_(spreadsheet, driverName, colSEmail) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  if (colSEmail && emailRegex.test(colSEmail)) {
+    return colSEmail;
+  }
+
+  const inlineMatch = driverName.match(/<([^\s@]+@[^\s@]+\.[^\s@]+)>/);
+  if (inlineMatch && emailRegex.test(inlineMatch[1].trim())) {
+    return inlineMatch[1].trim();
+  }
+
+  if (emailRegex.test(driverName)) {
+    return driverName.trim();
+  }
+
+  const driversSheet = spreadsheet.getSheetByName('Drivers');
+  if (!driversSheet) return null;
+
+  const lastRow = driversSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const data = driversSheet.getRange(2, 1, lastRow - 1, 8).getDisplayValues();
+  const target = driverName.toLowerCase();
+
+  for (let i = 0; i < data.length; i++) {
+    const name = String(data[i][0] || '').trim().toLowerCase();
+    const email = String(data[i][7] || '').trim();
+    if (name === target && emailRegex.test(email)) {
+      return email;
+    }
+  }
+
+  return null;
+}
+
+function runFullSystemCheck() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lines = [];
+
+  if (!ss) {
+    lines.push('ERROR: Script is not bound to a spreadsheet.');
+    Logger.log(lines.join('\n'));
+    return lines.join('\n');
+  }
+
+  lines.push('=== SYSTEM HEALTH CHECK ===');
+  lines.push('Spreadsheet: ' + ss.getName());
+  lines.push('Tabs: ' + ss.getSheets().map(s => s.getName()).join(', '));
+
+  ['Trip Requests', 'Form Responses', 'Email Log', 'Drivers'].forEach(name => {
+    lines.push(`Sheet "${name}": ${ss.getSheetByName(name) ? 'OK' : 'MISSING'}`);
+  });
+  if (typeof APPROVAL_CONFIG !== 'undefined') {
+    const appSheet = ss.getSheetByName(APPROVAL_CONFIG.approversSheet);
+    lines.push(`Sheet "${APPROVAL_CONFIG.approversSheet}": ${appSheet ? 'OK' : 'OPTIONAL / NOT FOUND'}`);
+    lines.push('Approval Web App URL set: ' + Boolean(APPROVAL_CONFIG.webAppUrl && !/PASTE|TODO/i.test(APPROVAL_CONFIG.webAppUrl)));
+  }
+
+  lines.push('SMS enabled: ' + Boolean(typeof SMS_CONFIG !== 'undefined' && SMS_CONFIG.enabled));
+  lines.push('ARKESEL_API_KEY set: ' + Boolean(PropertiesService.getScriptProperties().getProperty('ARKESEL_API_KEY')));
+  lines.push('TEST_PHONE set: ' + Boolean(PropertiesService.getScriptProperties().getProperty('TEST_PHONE')));
+  lines.push('Remaining email quota: ' + MailApp.getRemainingDailyQuota());
+
+  const triggers = ScriptApp.getProjectTriggers();
+  const hasFn = (fn) => triggers.some(t => t.getHandlerFunction() === fn);
+  lines.push('Triggers count: ' + triggers.length);
+  lines.push('Trigger notifyOnStatusChange: ' + hasFn('notifyOnStatusChange'));
+  lines.push('Trigger onStatusPendingApproval: ' + hasFn('onStatusPendingApproval'));
+  lines.push('Trigger onTransportFormSubmit: ' + hasFn('onTransportFormSubmit'));
+  lines.push('Trigger completeOverdueTrips: ' + hasFn('completeOverdueTrips'));
+
+  const tripSheet = ss.getSheetByName('Trip Requests');
+  if (tripSheet && tripSheet.getLastRow() >= TRIP_START_ROW) {
+    const row7 = tripSheet.getRange(TRIP_START_ROW, 1, 1, Math.max(tripSheet.getLastColumn(), 31)).getDisplayValues()[0];
+    lines.push(`Row 7 Req#: "${row7[COL_IDX.requestNo] || ''}" | Status: "${row7[COL_IDX.status] || ''}" | Phone(D): "${row7[COL_IDX.phone] || ''}" -> "${normalizePhone_(row7[COL_IDX.phone])}" | ApproverPhone(AE): "${row7[30] || ''}" -> "${normalizePhone_(row7[30])}"`);
+  }
+
+  const report = lines.join('\n');
+  Logger.log(report);
+  try {
+    SpreadsheetApp.getUi().alert('Full System Check', report, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (err) {}
+  return report;
+}
